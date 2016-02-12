@@ -72,10 +72,11 @@ typedef struct _oltunedcomb   // Data structure for this object
 //prototypes for methods
 void *oltunedcomb_new(t_symbol *s, short argc, t_atom *argv);
 void oltunedcomb_free(t_oltunedcomb *x);
-t_int *oltunedcomb_perform1(t_int *w); // peform routine with one signal inlet connected
-t_int *oltunedcomb_perform2(t_int *w); // perform routine with two signal inlets connected
-void oltunedcomb_dsp(t_oltunedcomb *x, t_signal **sp, short *count);
+//t_int *oltunedcomb_perform1(t_int *w); // peform routine with one signal inlet connected
+//t_int *oltunedcomb_perform2(t_int *w); // perform routine with two signal inlets connected
+//void oltunedcomb_dsp(t_oltunedcomb *x, t_signal **sp, short *count);
 void oltunedcomb_dsp64(t_oltunedcomb *x, t_object *dsp64, short *count, double samplerate, long maxvectorsize, long flags);
+void oltunedcomb_perform64(t_oltunedcomb *x, t_object *dsp64, double **ins, long numins, double **outs, long numouts, long sampleframes, long flags, void *userparam);
 void oltunedcomb_assist(t_oltunedcomb *x, void *b, long m, long a, char *s);
 
 //custom attribute set method prototypes
@@ -110,7 +111,7 @@ int C74_EXPORT main(void)
   class_obexoffset_set(c, calcoffset(t_oltunedcomb, obex));
   
   // Make methods accessible for our class:
-  class_addmethod(c, (method)oltunedcomb_dsp,     "dsp", A_CANT, 0L);
+//  class_addmethod(c, (method)oltunedcomb_dsp,     "dsp", A_CANT, 0L);
   class_addmethod(c, (method)oltunedcomb_dsp64, "dsp64", A_CANT, 0);
   class_addmethod(c, (method)object_obex_dumpout,   "dumpout", A_CANT,0);
   class_addmethod(c, (method)object_obex_quickref,  "quickref", A_CANT, 0);
@@ -225,14 +226,96 @@ void oltunedcomb_free(t_oltunedcomb *x)
   if(x->buffer) free(x->buffer);
 }
 
-void oltunedcomb_dsp(t_oltunedcomb *x, t_signal **sp, short *count)
+//void oltunedcomb_dsp(t_oltunedcomb *x, t_signal **sp, short *count)
+//{
+//  x->sr = sp[0]->s_sr;
+//  x->spms = x->sr / 1000.;
+//  x->dc_coeff = 1 - ( 126. / x->sr); // 126 = ~ 2pi * 20.
+//  
+//  if(count[1]) dsp_add(oltunedcomb_perform2, 5, x, sp[0]->s_vec, sp[1]->s_vec, sp[2]->s_vec, sp[0]->s_n);
+//  else dsp_add(oltunedcomb_perform1, 4, x, sp[0]->s_vec, sp[2]->s_vec, sp[0]->s_n);
+//}
+
+void oltunedcomb_dsp64(t_oltunedcomb *x, t_object *dsp64, short *count, double samplerate, long maxvectorsize, long flags)
 {
-  x->sr = sp[0]->s_sr;
+  x->sr = samplerate;
   x->spms = x->sr / 1000.;
   x->dc_coeff = 1 - ( 126. / x->sr); // 126 = ~ 2pi * 20.
   
-  if(count[1]) dsp_add(oltunedcomb_perform2, 5, x, sp[0]->s_vec, sp[1]->s_vec, sp[2]->s_vec, sp[0]->s_n);
-  else dsp_add(oltunedcomb_perform1, 4, x, sp[0]->s_vec, sp[2]->s_vec, sp[0]->s_n);
+  dsp_add64(dsp64, (t_object *) x, (t_perfroutine64) oltunedcomb_perform64, 0, 0);
+}
+
+void oltunedcomb_perform64(t_oltunedcomb *x, t_object *dsp64, double **ins, long numins, double **outs, long numouts, long sampleframes, long flags, void *userparam)
+{
+  t_double *in1 = ins[0];
+  t_double *in2 = ins[1];
+  t_double *out = outs[0];
+  int n = sampleframes;
+  
+  int i;
+  double output = 0.;
+  double sigfreq, delay_samples, dcx, dcy, antidenormal_noise;
+  
+  for (i = 0; i < n; i++)
+  {
+    // update the freq based on signal in inlet 2
+    sigfreq = *in2++;
+    
+    if(sigfreq > x->min_freq)
+    {
+      x->freq = sigfreq;
+      
+      delay_samples = ( x->sr / sigfreq); // = length of 1 cycle at freq in samples @ SR
+      
+      if(x->polarity == 0) delay_samples = delay_samples / 2.;
+      
+      if(x->interp == 0 || x->interp == 1)
+      {
+        if( delay_samples <= x->max_delay_time )
+        {
+          x->delay_time = delay_samples;
+        }
+        else x->delay_time = x->max_delay_time - 1;
+      }
+      else if (x->interp == 2) oltunedcomb_update_apcoeff(x, delay_samples); // if allpass interpolation, update the coefficent
+      
+      oltunedcomb_update_fbk(x);
+    }
+    
+    switch(x->interp)
+    {
+      case 0: // no interpolation
+        output = oltunedcomb_interpolate_none(x);
+        break;
+      case 1: // linear interpolation
+        output = oltunedcomb_interpolate_lin(x);
+        break;
+      case 2: // allpass interpolation
+        output = oltunedcomb_interpolate_ap(x);
+        break;
+      default:
+        break;
+    }
+    
+    antidenormal_noise = (double) rand() * 1.0e-14;
+    
+    if(x->lpf == 1 && x->lpf_c != 1.) x->buffer[x->write_address] = oltunedcomb_process_lpf( x, *in1++ + (output * x->fbk) ) + antidenormal_noise;
+    else x->buffer[x->write_address] = ( *in1++ + (output * x->fbk) ) + antidenormal_noise;
+    
+    if(++x->write_address == x->max_delay_time) x->write_address = 0;
+    
+    //dcfilter
+    if(x->dcblock == 1)
+    {
+      dcx = x->last_out = output;
+      dcy = dcx - x->dc_xm1 + x->dc_coeff * x->dc_ym1;
+      x->dc_xm1 = dcx;
+      x->dc_ym1 = dcy;
+    }
+    else dcy = x->last_out = output;
+    
+    *out++ = dcy;
+  }
 }
 
 t_max_err oltunedcomb_min_freq(t_oltunedcomb *x, void *attr, long ac, t_atom *av)
@@ -406,7 +489,7 @@ t_max_err oltunedcomb_interpolator(t_oltunedcomb *x, void *attr, long ac, t_atom
   }
   return MAX_ERR_NONE;
 }
-
+/*
 t_int *oltunedcomb_perform1(t_int *w)
 {
   t_oltunedcomb *x = (t_oltunedcomb *)(w[1]); // object is first arg
@@ -531,7 +614,7 @@ t_int *oltunedcomb_perform2(t_int *w)
   
   return (w + 6); // always add one more than the 2nd argument in dsp_add()
 }
-
+*/
 double oltunedcomb_process_lpf(t_oltunedcomb *x, double input)
 {
   double output = 0.;
